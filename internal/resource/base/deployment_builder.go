@@ -334,7 +334,7 @@ func (b *DeploymentBuilder) Update(object client.Object) error {
 		})
 	}
 
-	deployment.Spec.Replicas = b.service.Replicas
+	deployment.Spec.Replicas = b.service.GetEffectiveReplicas()
 
 	deployment.Spec.Selector = &metav1.LabelSelector{
 		MatchLabels: metadata.LabelsSelector(b.instance, b.serviceName),

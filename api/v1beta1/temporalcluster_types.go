@@ -28,10 +28,12 @@ import (
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"go.temporal.io/server/common/primitives"
 	"golang.org/x/exp/slices"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 )
 
 // LogSpec contains the temporal logging configuration.
@@ -62,6 +64,32 @@ type LogSpec struct {
 	Development bool `json:"development"`
 }
 
+// AutoscalingSpec defines the configuration for Horizontal Pod Autoscaling.
+type AutoscalingSpec struct {
+	// MinReplicas is the lower limit for the number of replicas to which the autoscaler
+	// can scale down. It defaults to 1 pod.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MinReplicas *int32 `json:"minReplicas,omitempty"`
+
+	// MaxReplicas is the upper limit for the number of replicas to which the autoscaler can scale up.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxReplicas *int32 `json:"maxReplicas,omitempty"`
+
+	// Metrics contains the specifications for which to use to calculate the
+	// desired replica count (the maximum replica count across all metrics will
+	// be used). If not set, defaults to 80% CPU and 70% memory utilization.
+	// +optional
+	Metrics []autoscalingv2.MetricSpec `json:"metrics,omitempty"`
+
+	// Behavior configures the scaling behavior of the target
+	// in both Up and Down directions (scaleUp and scaleDown fields respectively).
+	// If not set, the default HPAScalingRules for scale up and scale down are used.
+	// +optional
+	Behavior *autoscalingv2.HorizontalPodAutoscalerBehavior `json:"behavior,omitempty"`
+}
+
 // ServiceSpec contains a temporal service specifications.
 type ServiceSpec struct {
 	// Port defines a custom gRPC port for the service.
@@ -88,7 +116,7 @@ type ServiceSpec struct {
 	// Number of desired replicas for the service. Default to 1.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
-	Replicas *int32 `json:"replicas"`
+	Replicas *int32 `json:"replicas,omitempty"`
 	// Compute Resources required by this service.
 	// More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
 	// +optional
@@ -100,6 +128,10 @@ type ServiceSpec struct {
 	// InitContainers adds a list of init containers to the service's deployment.
 	// +optional
 	InitContainers []corev1.Container `json:"initContainers,omitempty"`
+	// Autoscaling enables horizontal pod autoscaling for the service.
+	// When enabled, the controller will bypass the replicas field and create an HPA resource instead.
+	// +optional
+	Autoscaling *AutoscalingSpec `json:"autoscaling,omitempty"`
 	// ServiceAccountOverride
 }
 
@@ -114,6 +146,30 @@ type InternalFrontendServiceSpec struct {
 
 func (s *InternalFrontendServiceSpec) IsEnabled() bool {
 	return s != nil && s.Enabled
+}
+
+// IsAutoscalingEnabled returns true if autoscaling is enabled for the service.
+func (s *ServiceSpec) IsAutoscalingEnabled() bool {
+	return s != nil && s.Autoscaling != nil
+}
+
+// GetEffectiveReplicas returns the replica count to use for the deployment.
+// If autoscaling is enabled, returns the current replicas value which HPA may have
+// updated via the coordination logic. Otherwise, returns the configured replicas value.
+func (s *ServiceSpec) GetEffectiveReplicas() *int32 {
+	// If autoscaling is configured, respect the current Replicas value which may be
+	// updated by HPA coordination logic, but ensure it doesn't go below MinReplicas
+	if s.IsAutoscalingEnabled() && s.Autoscaling.MinReplicas != nil {
+		if s.Replicas != nil {
+			replicas := max(*s.Autoscaling.MinReplicas, *s.Replicas)
+			return &replicas
+		}
+		return s.Autoscaling.MinReplicas
+	}
+	if s.Replicas != nil {
+		return s.Replicas
+	}
+	return ptr.To[int32](1)
 }
 
 // ServicesSpec contains all temporal services specifications.

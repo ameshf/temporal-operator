@@ -41,6 +41,7 @@ import (
 	istionetworkingv1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
 	istiosecurityv1beta1 "istio.io/client-go/pkg/apis/security/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -76,6 +77,7 @@ type TemporalClusterReconciler struct {
 //+kubebuilder:rbac:groups="",resources=events,verbs=get;create;patch
 //+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;delete
+//+kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;delete
 //+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;delete
 //+kubebuilder:rbac:groups="networking.k8s.io",resources=ingresses,verbs=get;list;watch;create;update;delete
 //+kubebuilder:rbac:groups="cert-manager.io",resources=certificates;issuers,verbs=get;list;watch;create;update;delete
@@ -167,6 +169,11 @@ func (r *TemporalClusterReconciler) reconcileResources(ctx context.Context, temp
 		return fmt.Errorf("can't compute configmap hash: %w", err)
 	}
 
+	// Sync replicas from current Deployments (HPA decisions) into the spec
+	if err := r.coordinateWithHPA(ctx, temporalCluster); err != nil {
+		return err
+	}
+
 	builders, err := r.resourceBuilders(temporalCluster, configHash)
 	if err != nil {
 		return err
@@ -222,6 +229,7 @@ func (r *TemporalClusterReconciler) resourceBuilders(temporalCluster *v1beta1.Te
 
 		builders = append(builders, base.NewServiceAccountBuilder(serviceName, temporalCluster, r.Scheme))
 		builders = append(builders, base.NewDeploymentBuilder(serviceName, temporalCluster, r.Scheme, specs, configHash))
+		builders = append(builders, base.NewHPABuilder(serviceName, temporalCluster, r.Scheme, specs))
 		builders = append(builders, base.NewHeadlessServiceBuilder(serviceName, temporalCluster, r.Scheme, specs))
 
 		builders = append(builders, istio.NewPeerAuthenticationBuilder(serviceName, temporalCluster, r.Scheme, specs))
@@ -273,9 +281,117 @@ func (r *TemporalClusterReconciler) handleErrorWithRequeue(cluster *v1beta1.Temp
 	return reconcile.Result{RequeueAfter: requeueAfter}, err
 }
 
+// coordinateWithHPA synchronizes the TemporalCluster spec with HPA scaling decisions.
+// When HPA scales a deployment, this method updates the corresponding ServiceSpec.Replicas
+// to reflect the HPA's decision, preventing the controller from overriding HPA scaling.
+func (r *TemporalClusterReconciler) coordinateWithHPA(ctx context.Context, cluster *v1beta1.TemporalCluster) error {
+	logger := log.FromContext(ctx)
+	needsUpdate := false
+
+	// Map of service names to their deployment objects (live state)
+	deployments := make(map[string]*appsv1.Deployment)
+	deployList := &appsv1.DeploymentList{}
+	if err := r.List(ctx, deployList,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingFields{ownerKey: cluster.Name},
+	); err != nil {
+		return fmt.Errorf("failed to list deployments for HPA coordination: %w", err)
+	}
+	for i := range deployList.Items {
+		deployment := &deployList.Items[i]
+		// Extract service name from deployment name (remove cluster prefix)
+		serviceName := deployment.Name
+		if clusterPrefix := cluster.Name + "-"; len(serviceName) > len(clusterPrefix) {
+			serviceName = serviceName[len(clusterPrefix):]
+		}
+		deployments[serviceName] = deployment
+	}
+
+	// Check each service that has autoscaling enabled
+	services := []primitives.ServiceName{
+		primitives.FrontendService,
+		primitives.HistoryService,
+		primitives.MatchingService,
+		primitives.WorkerService,
+		primitives.InternalFrontendService,
+	}
+
+	for _, serviceName := range services {
+		serviceSpec, err := cluster.Spec.Services.GetServiceSpec(serviceName)
+		if err != nil || serviceSpec == nil || !serviceSpec.IsAutoscalingEnabled() {
+			continue // Skip services without autoscaling
+		}
+
+		deployment, exists := deployments[string(serviceName)]
+		if !exists {
+			continue // Skip if deployment not found
+		}
+
+		// Check if HPA has scaled the deployment
+		currentReplicas := deployment.Spec.Replicas
+		if currentReplicas == nil {
+			continue // Skip if deployment has no replica spec
+		}
+
+		specReplicas := serviceSpec.Replicas
+		if specReplicas == nil || *specReplicas != *currentReplicas {
+			// HPA has changed the deployment replicas, sync the spec
+			// Update the service spec to match what HPA set
+			if err := r.updateServiceReplicas(cluster, serviceName, *currentReplicas); err != nil {
+				return fmt.Errorf("failed to update %s service replicas: %w", serviceName, err)
+			}
+			needsUpdate = true
+		}
+	}
+
+	// Update the cluster spec if any replicas were changed
+	if needsUpdate {
+		if err := r.Update(ctx, cluster); err != nil {
+			return fmt.Errorf("failed to update cluster spec with HPA coordination: %w", err)
+		}
+		logger.Info("Updated TemporalCluster spec to coordinate with HPA scaling decisions")
+	}
+
+	return nil
+}
+
+// updateServiceReplicas updates the replica count for a specific service in the cluster spec.
+func (r *TemporalClusterReconciler) updateServiceReplicas(cluster *v1beta1.TemporalCluster, serviceName primitives.ServiceName, replicas int32) error {
+	switch serviceName {
+	case primitives.FrontendService:
+		if cluster.Spec.Services.Frontend == nil {
+			cluster.Spec.Services.Frontend = &v1beta1.ServiceSpec{}
+		}
+		cluster.Spec.Services.Frontend.Replicas = &replicas
+	case primitives.HistoryService:
+		if cluster.Spec.Services.History == nil {
+			cluster.Spec.Services.History = &v1beta1.ServiceSpec{}
+		}
+		cluster.Spec.Services.History.Replicas = &replicas
+	case primitives.MatchingService:
+		if cluster.Spec.Services.Matching == nil {
+			cluster.Spec.Services.Matching = &v1beta1.ServiceSpec{}
+		}
+		cluster.Spec.Services.Matching.Replicas = &replicas
+	case primitives.WorkerService:
+		if cluster.Spec.Services.Worker == nil {
+			cluster.Spec.Services.Worker = &v1beta1.ServiceSpec{}
+		}
+		cluster.Spec.Services.Worker.Replicas = &replicas
+	case primitives.InternalFrontendService:
+		if cluster.Spec.Services.InternalFrontend == nil {
+			cluster.Spec.Services.InternalFrontend = &v1beta1.InternalFrontendServiceSpec{}
+		}
+		cluster.Spec.Services.InternalFrontend.Replicas = &replicas
+	default:
+		return fmt.Errorf("unknown service name: %s", serviceName)
+	}
+	return nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *TemporalClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	for _, resource := range []client.Object{&appsv1.Deployment{}, &corev1.ConfigMap{}, &corev1.Service{}, &corev1.ServiceAccount{}, &networkingv1.Ingress{}, &batchv1.Job{}} {
+	for _, resource := range []client.Object{&appsv1.Deployment{}, &autoscalingv2.HorizontalPodAutoscaler{}, &corev1.ConfigMap{}, &corev1.Service{}, &corev1.ServiceAccount{}, &networkingv1.Ingress{}, &batchv1.Job{}} {
 		if err := mgr.GetFieldIndexer().IndexField(context.Background(), resource, ownerKey, addResourceToIndex); err != nil {
 			return err
 		}
@@ -288,6 +404,7 @@ func (r *TemporalClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			predicate.AnnotationChangedPredicate{},
 		))).
 		Owns(&appsv1.Deployment{}).
+		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).
@@ -334,6 +451,7 @@ func (r *TemporalClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func addResourceToIndex(rawObj client.Object) []string {
 	switch resourceObject := rawObj.(type) {
 	case *appsv1.Deployment,
+		*autoscalingv2.HorizontalPodAutoscaler,
 		*corev1.ConfigMap,
 		*corev1.Service,
 		*corev1.ServiceAccount,
