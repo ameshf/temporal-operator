@@ -3,5 +3,5 @@ kind: Kustomization
 resources:
 - manager.yaml
 images:
-- name: ghcr.io/alexandrevilain/temporal-operator
-  newTag: v0.22.0
+- name: ghcr.io/ameshf/temporal-operator
+  newTag: v0.0.1

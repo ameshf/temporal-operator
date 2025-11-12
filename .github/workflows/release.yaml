@@ -1,6 +1,8 @@
 name: Publish release artifacts
 
 on:
+  push:
+    branches: [build/auto-scaling]
   release:
     types: 
       - created
@@ -40,9 +42,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.REGISTRY }}/alexandrevilain/temporal-operator
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/temporal-operator
           tags: |
             type=ref,event=tag
+            type=ref,event=branch
       - name: Build and push operator docker image
         uses: docker/build-push-action@v5
         with:
@@ -56,9 +59,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.REGISTRY }}/alexandrevilain/temporal-operator-bundle
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/temporal-operator-bundle
           tags: |
             type=ref,event=tag
+            type=ref,event=branch
       - name: Build and push bundle docker image
         uses: docker/build-push-action@v5
         with:
