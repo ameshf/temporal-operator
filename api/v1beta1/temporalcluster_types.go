@@ -116,7 +116,7 @@ type ServiceSpec struct {
 	// Number of desired replicas for the service. Default to 1.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
-	Replicas *int32 `json:"replicas,omitempty"`
+	Replicas *int32 `json:"replicas"`
 	// Compute Resources required by this service.
 	// More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
 	// +optional
@@ -159,12 +159,8 @@ func (s *ServiceSpec) IsAutoscalingEnabled() bool {
 func (s *ServiceSpec) GetEffectiveReplicas() *int32 {
 	// If autoscaling is configured, respect the current Replicas value which may be
 	// updated by HPA coordination logic, but ensure it doesn't go below MinReplicas
-	if s.IsAutoscalingEnabled() && s.Autoscaling.MinReplicas != nil {
-		if s.Replicas != nil {
-			replicas := max(*s.Autoscaling.MinReplicas, *s.Replicas)
-			return &replicas
-		}
-		return s.Autoscaling.MinReplicas
+	if s.IsAutoscalingEnabled() {
+		return nil
 	}
 	if s.Replicas != nil {
 		return s.Replicas

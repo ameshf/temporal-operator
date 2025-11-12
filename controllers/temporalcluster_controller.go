@@ -169,20 +169,37 @@ func (r *TemporalClusterReconciler) reconcileResources(ctx context.Context, temp
 		return fmt.Errorf("can't compute configmap hash: %w", err)
 	}
 
-	// Sync replicas from current Deployments (HPA decisions) into the spec
-	if err := r.coordinateWithHPA(ctx, temporalCluster); err != nil {
-		return err
-	}
-
 	builders, err := r.resourceBuilders(temporalCluster, configHash)
 	if err != nil {
 		return err
 	}
 
-	objects, err := r.Reconciler.ReconcileBuilders(ctx, temporalCluster, builders)
+	// Separate deployment builders from others to handle SSA for Deployments
+	var deploymentBuilders []resource.Builder
+	var otherBuilders []resource.Builder
+
+	for _, builder := range builders {
+		if _, isDeployment := builder.(*base.DeploymentBuilder); isDeployment {
+			deploymentBuilders = append(deploymentBuilders, builder)
+		} else {
+			otherBuilders = append(otherBuilders, builder)
+		}
+	}
+
+	// Reconcile non-deployment resources normally
+	objects, err := r.Reconciler.ReconcileBuilders(ctx, temporalCluster, otherBuilders)
 	if err != nil {
 		return err
 	}
+
+	// Handle deployments with SSA
+	deploymentObjects, err := r.reconcileDeploymentsWithSSA(ctx, deploymentBuilders)
+	if err != nil {
+		return err
+	}
+
+	// Combine all objects
+	objects = append(objects, deploymentObjects...)
 
 	statuses, err := status.ReconciledObjectsToServiceStatuses(temporalCluster, objects)
 	if err != nil {
@@ -281,110 +298,48 @@ func (r *TemporalClusterReconciler) handleErrorWithRequeue(cluster *v1beta1.Temp
 	return reconcile.Result{RequeueAfter: requeueAfter}, err
 }
 
-// coordinateWithHPA synchronizes the TemporalCluster spec with HPA scaling decisions.
-// When HPA scales a deployment, this method updates the corresponding ServiceSpec.Replicas
-// to reflect the HPA's decision, preventing the controller from overriding HPA scaling.
-func (r *TemporalClusterReconciler) coordinateWithHPA(ctx context.Context, cluster *v1beta1.TemporalCluster) error {
-	logger := log.FromContext(ctx)
-	needsUpdate := false
+func (r *TemporalClusterReconciler) reconcileDeploymentsWithSSA(ctx context.Context, builders []resource.Builder) ([]client.Object, error) {
+	objects := make([]client.Object, 0)
 
-	// Map of service names to their deployment objects (live state)
-	deployments := make(map[string]*appsv1.Deployment)
-	deployList := &appsv1.DeploymentList{}
-	if err := r.List(ctx, deployList,
-		client.InNamespace(cluster.Namespace),
-		client.MatchingFields{ownerKey: cluster.Name},
-	); err != nil {
-		return fmt.Errorf("failed to list deployments for HPA coordination: %w", err)
-	}
-	for i := range deployList.Items {
-		deployment := &deployList.Items[i]
-		// Extract service name from deployment name (remove cluster prefix)
-		serviceName := deployment.Name
-		if clusterPrefix := cluster.Name + "-"; len(serviceName) > len(clusterPrefix) {
-			serviceName = serviceName[len(clusterPrefix):]
+	for _, builder := range builders {
+		deploymentBuilder := builder.(*base.DeploymentBuilder)
+
+		// Build the desired deployment
+		desiredObj := deploymentBuilder.Build()
+		desired := desiredObj.(*appsv1.Deployment)
+
+		// Update the desired deployment with the current configuration
+		if err := deploymentBuilder.Update(desired); err != nil {
+			return nil, fmt.Errorf("failed to update deployment configuration: %w", err)
 		}
-		deployments[serviceName] = deployment
-	}
-
-	// Check each service that has autoscaling enabled
-	services := []primitives.ServiceName{
-		primitives.FrontendService,
-		primitives.HistoryService,
-		primitives.MatchingService,
-		primitives.WorkerService,
-		primitives.InternalFrontendService,
+		// Apply all Deployments with SSA for consistency
+		if err := r.applyDeploymentWithSSA(ctx, desired); err != nil {
+			return nil, fmt.Errorf("failed to apply deployment %s with SSA: %w", desired.Name, err)
+		}
+		// Fetch the current state of the deployment after apply
+		current := &appsv1.Deployment{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(desired), current); err != nil {
+			return nil, fmt.Errorf("failed to get deployment %s after SSA: %w", desired.Name, err)
+		}
+		objects = append(objects, current)
 	}
 
-	for _, serviceName := range services {
-		serviceSpec, err := cluster.Spec.Services.GetServiceSpec(serviceName)
-		if err != nil || serviceSpec == nil || !serviceSpec.IsAutoscalingEnabled() {
-			continue // Skip services without autoscaling
-		}
-
-		deployment, exists := deployments[string(serviceName)]
-		if !exists {
-			continue // Skip if deployment not found
-		}
-
-		// Check if HPA has scaled the deployment
-		currentReplicas := deployment.Spec.Replicas
-		if currentReplicas == nil {
-			continue // Skip if deployment has no replica spec
-		}
-
-		specReplicas := serviceSpec.Replicas
-		if specReplicas == nil || *specReplicas != *currentReplicas {
-			// HPA has changed the deployment replicas, sync the spec
-			// Update the service spec to match what HPA set
-			if err := r.updateServiceReplicas(cluster, serviceName, *currentReplicas); err != nil {
-				return fmt.Errorf("failed to update %s service replicas: %w", serviceName, err)
-			}
-			needsUpdate = true
-		}
-	}
-
-	// Update the cluster spec if any replicas were changed
-	if needsUpdate {
-		if err := r.Update(ctx, cluster); err != nil {
-			return fmt.Errorf("failed to update cluster spec with HPA coordination: %w", err)
-		}
-		logger.Info("Updated TemporalCluster spec to coordinate with HPA scaling decisions")
-	}
-
-	return nil
+	return objects, nil
 }
 
-// updateServiceReplicas updates the replica count for a specific service in the cluster spec.
-func (r *TemporalClusterReconciler) updateServiceReplicas(cluster *v1beta1.TemporalCluster, serviceName primitives.ServiceName, replicas int32) error {
-	switch serviceName {
-	case primitives.FrontendService:
-		if cluster.Spec.Services.Frontend == nil {
-			cluster.Spec.Services.Frontend = &v1beta1.ServiceSpec{}
+// applyDeploymentWithSSA applies a deployment using Server-Side Apply with field management.
+func (r *TemporalClusterReconciler) applyDeploymentWithSSA(ctx context.Context, desired *appsv1.Deployment) error {
+	desired.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}
+
+	// replicas must be omitted when HPA is enabled (builder should already do this)
+	// if autoscalingEnabled { desired.Spec.Replicas = nil }
+
+	if err := r.Patch(ctx, desired, client.Apply, client.FieldOwner("temporal-operator")); err != nil {
+		if apierrors.IsConflict(err) {
+			// Only if you’re intentionally handing over ownership:
+			return r.Patch(ctx, desired, client.Apply, client.FieldOwner("temporal-operator"), client.ForceOwnership)
 		}
-		cluster.Spec.Services.Frontend.Replicas = &replicas
-	case primitives.HistoryService:
-		if cluster.Spec.Services.History == nil {
-			cluster.Spec.Services.History = &v1beta1.ServiceSpec{}
-		}
-		cluster.Spec.Services.History.Replicas = &replicas
-	case primitives.MatchingService:
-		if cluster.Spec.Services.Matching == nil {
-			cluster.Spec.Services.Matching = &v1beta1.ServiceSpec{}
-		}
-		cluster.Spec.Services.Matching.Replicas = &replicas
-	case primitives.WorkerService:
-		if cluster.Spec.Services.Worker == nil {
-			cluster.Spec.Services.Worker = &v1beta1.ServiceSpec{}
-		}
-		cluster.Spec.Services.Worker.Replicas = &replicas
-	case primitives.InternalFrontendService:
-		if cluster.Spec.Services.InternalFrontend == nil {
-			cluster.Spec.Services.InternalFrontend = &v1beta1.InternalFrontendServiceSpec{}
-		}
-		cluster.Spec.Services.InternalFrontend.Replicas = &replicas
-	default:
-		return fmt.Errorf("unknown service name: %s", serviceName)
+		return err
 	}
 	return nil
 }
