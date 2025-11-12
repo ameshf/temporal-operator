@@ -4,4 +4,4 @@ resources:
 - manager.yaml
 images:
 - name: ghcr.io/ameshf/temporal-operator
-  newTag: v0.23.0
+  newTag: v0.22.1-auto-scaling
