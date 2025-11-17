@@ -174,32 +174,10 @@ func (r *TemporalClusterReconciler) reconcileResources(ctx context.Context, temp
 		return err
 	}
 
-	// Separate deployment builders from others to handle SSA for Deployments
-	var deploymentBuilders []resource.Builder
-	var otherBuilders []resource.Builder
-
-	for _, builder := range builders {
-		if _, isDeployment := builder.(*base.DeploymentBuilder); isDeployment {
-			deploymentBuilders = append(deploymentBuilders, builder)
-		} else {
-			otherBuilders = append(otherBuilders, builder)
-		}
-	}
-
-	// Reconcile non-deployment resources normally
-	objects, err := r.Reconciler.ReconcileBuilders(ctx, temporalCluster, otherBuilders)
+	objects, err := r.Reconciler.ReconcileBuilders(ctx, temporalCluster, builders)
 	if err != nil {
 		return err
 	}
-
-	// Handle deployments with SSA
-	deploymentObjects, err := r.reconcileDeploymentsWithSSA(ctx, deploymentBuilders)
-	if err != nil {
-		return err
-	}
-
-	// Combine all objects
-	objects = append(objects, deploymentObjects...)
 
 	statuses, err := status.ReconciledObjectsToServiceStatuses(temporalCluster, objects)
 	if err != nil {
@@ -296,52 +274,6 @@ func (r *TemporalClusterReconciler) handleErrorWithRequeue(cluster *v1beta1.Temp
 	}
 	v1beta1.SetTemporalClusterReconcileError(cluster, metav1.ConditionTrue, reason, err.Error())
 	return reconcile.Result{RequeueAfter: requeueAfter}, err
-}
-
-func (r *TemporalClusterReconciler) reconcileDeploymentsWithSSA(ctx context.Context, builders []resource.Builder) ([]client.Object, error) {
-	objects := make([]client.Object, 0)
-
-	for _, builder := range builders {
-		deploymentBuilder := builder.(*base.DeploymentBuilder)
-
-		// Build the desired deployment
-		desiredObj := deploymentBuilder.Build()
-		desired := desiredObj.(*appsv1.Deployment)
-
-		// Update the desired deployment with the current configuration
-		if err := deploymentBuilder.Update(desired); err != nil {
-			return nil, fmt.Errorf("failed to update deployment configuration: %w", err)
-		}
-		// Apply all Deployments with SSA for consistency
-		if err := r.applyDeploymentWithSSA(ctx, desired); err != nil {
-			return nil, fmt.Errorf("failed to apply deployment %s with SSA: %w", desired.Name, err)
-		}
-		// Fetch the current state of the deployment after apply
-		current := &appsv1.Deployment{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(desired), current); err != nil {
-			return nil, fmt.Errorf("failed to get deployment %s after SSA: %w", desired.Name, err)
-		}
-		objects = append(objects, current)
-	}
-
-	return objects, nil
-}
-
-// applyDeploymentWithSSA applies a deployment using Server-Side Apply with field management.
-func (r *TemporalClusterReconciler) applyDeploymentWithSSA(ctx context.Context, desired *appsv1.Deployment) error {
-	desired.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}
-
-	// replicas must be omitted when HPA is enabled (builder should already do this)
-	// if autoscalingEnabled { desired.Spec.Replicas = nil }
-
-	if err := r.Patch(ctx, desired, client.Apply, client.FieldOwner("temporal-operator")); err != nil {
-		if apierrors.IsConflict(err) {
-			// Only if you’re intentionally handing over ownership:
-			return r.Patch(ctx, desired, client.Apply, client.FieldOwner("temporal-operator"), client.ForceOwnership)
-		}
-		return err
-	}
-	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

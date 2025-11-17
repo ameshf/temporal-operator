@@ -33,7 +33,6 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 )
 
 // LogSpec contains the temporal logging configuration.
@@ -151,21 +150,6 @@ func (s *InternalFrontendServiceSpec) IsEnabled() bool {
 // IsAutoscalingEnabled returns true if autoscaling is enabled for the service.
 func (s *ServiceSpec) IsAutoscalingEnabled() bool {
 	return s != nil && s.Autoscaling != nil
-}
-
-// GetEffectiveReplicas returns the replica count to use for the deployment.
-// If autoscaling is enabled, returns the current replicas value which HPA may have
-// updated via the coordination logic. Otherwise, returns the configured replicas value.
-func (s *ServiceSpec) GetEffectiveReplicas() *int32 {
-	// If autoscaling is configured, respect the current Replicas value which may be
-	// updated by HPA coordination logic, but ensure it doesn't go below MinReplicas
-	if s.IsAutoscalingEnabled() {
-		return nil
-	}
-	if s.Replicas != nil {
-		return s.Replicas
-	}
-	return ptr.To[int32](1)
 }
 
 // ServicesSpec contains all temporal services specifications.
